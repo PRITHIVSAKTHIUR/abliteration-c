@@ -5,7 +5,7 @@ import random
 import gc
 from tqdm import tqdm
 from transformers import (
-    AutoModelForCausalLM,
+    Qwen3VLForConditionalGeneration,  # Explicit import for Qwen3-VL
     AutoProcessor,
     BitsAndBytesConfig,
     AutoTokenizer
@@ -73,6 +73,8 @@ def get_refusal_direction(model, processor, device, layer_idx, num_instructions)
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": inst}
             ]
+            
+            # Prepare text input for Qwen3-VL
             text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             
             # For Qwen-VL, we treat this as text-only input if no image is provided
@@ -83,7 +85,7 @@ def get_refusal_direction(model, processor, device, layer_idx, num_instructions)
                 outputs = model(**inputs, output_hidden_states=True)
             
             # Extract hidden states from the specific layer
-            # Qwen2VL/Qwen2.5VL structure usually puts hidden_states in the output object
+            # Qwen3VL structure usually puts hidden_states in the output object
             # Shape: (batch, seq_len, hidden_size)
             # We take the last token of the prompt (the position where generation starts)
             hs = outputs.hidden_states[layer_idx] 
@@ -131,13 +133,21 @@ def apply_abliteration(model, refusal_dir, device):
     and Attention Output Projections against the refusal direction.
     """
     # Auto-detect layer structure. 
-    # Qwen2VL usually stores layers in model.model.layers
+    # Qwen3VL usually stores layers in model.model.layers or model.language_model.model.layers
+    # We try to find the standard transformer layers list
+    
+    layers = None
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         layers = model.model.layers
+    elif hasattr(model, "language_model") and hasattr(model.language_model, "model") and hasattr(model.language_model.model, "layers"):
+        layers = model.language_model.model.layers
     elif hasattr(model, "layers"):
         layers = model.layers
-    else:
-        raise ValueError("Could not find '.layers' in model structure.")
+    
+    if layers is None:
+         # Fallback search for layers
+        print("Debugging Model Structure keys:", model.__dict__.keys())
+        raise ValueError("Could not automatically find '.layers' in Qwen3VL structure.")
 
     refusal_dir = refusal_dir.to(device)
     
@@ -206,13 +216,13 @@ def process_model(
                 bnb_4bit_quant_type="nf4"
             )
 
-        # For Qwen-VL variants, trust_remote_code is often needed
+        # Load Processor
         processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True, token=hf_token)
         
-        # Load Model
+        # Load Model using specific Qwen3VL class
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         
-        model = AutoModelForCausalLM.from_pretrained(
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_id,
             quantization_config=quant_config,
             torch_dtype=dtype,
@@ -221,15 +231,28 @@ def process_model(
             token=hf_token
         )
         model.eval()
-        yield log("✅ Model loaded successfully.")
+        yield log("✅ Qwen3VL Model loaded successfully.")
 
     except Exception as e:
         yield log(f"❌ Error loading model: {e}")
         return
 
     # Determine Layer Index
-    # Qwen2VL layers are typically in model.model.layers
-    num_layers = len(model.model.layers)
+    # Try to find the number of layers dynamically
+    num_layers = 0
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        num_layers = len(model.model.layers)
+    elif hasattr(model, "language_model") and hasattr(model.language_model, "model"):
+         num_layers = len(model.language_model.model.layers)
+    else:
+        # Fallback for some VL models where text layers are deeper
+        # This is a safe guess for Qwen-VL architecture
+        try:
+             num_layers = len(model.model.layers)
+        except:
+             yield log("❌ Could not determine number of layers. Aborting.")
+             return
+
     target_layer_idx = int(num_layers * (layer_percentage / 100.0))
     yield log(f"🔍 Total Layers: {num_layers}. Targeting Layer {target_layer_idx} ({layer_percentage}% depth).")
 
@@ -287,10 +310,10 @@ def process_model(
 # Gradio Interface
 # -----------------------------------------------------------------------------
 
-with gr.Blocks(title="Qwen-VL Abliterator") as demo:
+with gr.Blocks(title="Qwen3-VL Abliterator") as demo:
     gr.Markdown(
         """
-        # 🧠 Qwen-VL / Text-Only Model Abliterator
+        # 🧠 Qwen3-VL / Text-Only Model Abliterator
         **Instructions:**
         1. Ensure `harmful.txt` and `harmless.txt` are present in the app directory.
         2. Enter your HF Token and Model details below.
@@ -300,9 +323,9 @@ with gr.Blocks(title="Qwen-VL Abliterator") as demo:
     
     with gr.Row():
         with gr.Column():
-            model_id_input = gr.Textbox(label="Source Model ID", value="Qwen/Qwen2-VL-2B-Instruct")
+            model_id_input = gr.Textbox(label="Source Model ID", value="Qwen/Qwen2.5-VL-7B-Instruct")
             token_input = gr.Textbox(label="Hugging Face Token (Write Access)", type="password")
-            repo_id_input = gr.Textbox(label="Target Repo ID (e.g. user/Qwen-Abliterated)", placeholder="user/my-new-model")
+            repo_id_input = gr.Textbox(label="Target Repo ID (e.g. user/Qwen3-VL-Abliterated)", placeholder="user/my-new-model")
         
         with gr.Column():
             layer_slider = gr.Slider(minimum=0, maximum=100, value=60, label="Layer Depth Percentage (%)", 
