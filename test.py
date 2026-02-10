@@ -403,4 +403,4 @@ with gr.Blocks(title="LLM Abliteration Studio") as app:
             )
 
 if __name__ == "__main__":
-    app.queue().launch(share=True)
+    app.queue().launch(share=True, debug=True)
