@@ -1,5 +1,5 @@
 jaxtyping
-transformers==4.57.1
+transformers==4.57.6
 tqdm
 einops
 torch
@@ -9,3 +9,6 @@ huggingface_hub
 gradio
 hf_xet
 matplotlib
+qwen-vl-utils
+tqdm
+scipy
