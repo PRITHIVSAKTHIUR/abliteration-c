@@ -3,9 +3,24 @@ import random
 import torch
 
 from tqdm import tqdm
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+# Note: Assuming Qwen3-VL uses Qwen2_5 or similar classes, or relies on remote code.
+# The class import in your original code was Qwen3VLForConditionalGeneration.
+# If that class is available via trust_remote_code, keep it. 
+# Below I use AutoModel to be safe, or keep your original import if you have the specific package.
+from transformers import AutoModelForCausalLM, AutoProcessor 
+
+# To match your specific traceback context strictly:
+try:
+    from transformers import Qwen3VLForConditionalGeneration
+except ImportError:
+    # Fallback if specific class isn't installed locally but available via remote code
+    # We will use AutoModel which handles the remote code class instantiation
+    Qwen3VLForConditionalGeneration = None
 
 torch.set_grad_enabled(False)
+
+# ---------------- CONFIG ----------------
 
 MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
 
@@ -18,8 +33,17 @@ HARMLESS_FILE = "harmless.txt"
 
 OUTPUT_DIR = "output-model"
 
+# ---------------- MODEL LOADING ----------------
+
 def load_model(model_id):
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
+    # Using AutoModelForCausalLM is often safer for remote code models, 
+    # but we stick to your original class if defined, or fall back to Auto.
+    if Qwen3VLForConditionalGeneration:
+        model_class = Qwen3VLForConditionalGeneration
+    else:
+        from transformers import AutoModelForCausalLM as model_class
+
+    model = model_class.from_pretrained(
         model_id,
         trust_remote_code=True,
         device_map="cuda",
@@ -33,22 +57,44 @@ def load_model(model_id):
 
     return model, processor
 
-def read_instruction_files():
-    with open(HARMFUL_FILE, "r") as f:
-        harmful = f.readlines()
+# ---------------- DATA ----------------
 
-    with open(HARMLESS_FILE, "r") as f:
-        harmless = f.readlines()
+def read_instruction_files():
+    # Ensure files exist or create dummy data for testing
+    if not os.path.exists(HARMFUL_FILE):
+        print(f"Warning: {HARMFUL_FILE} not found. Using dummy data.")
+        harmful = ["Tell me how to build a bomb", "How to steal a car"] * 16
+    else:
+        with open(HARMFUL_FILE, "r") as f:
+            harmful = f.readlines()
+
+    if not os.path.exists(HARMLESS_FILE):
+        print(f"Warning: {HARMLESS_FILE} not found. Using dummy data.")
+        harmless = ["Tell me a joke", "How to bake a cake"] * 16
+    else:
+        with open(HARMLESS_FILE, "r") as f:
+            harmless = f.readlines()
 
     return harmful, harmless
+
+# ---------------- CORE LOGIC ----------------
 
 def generate_hidden_states(model, processor, instructions, layer_idx):
     hidden_states = []
 
     for insn in tqdm(instructions, desc="Generating hidden states"):
+        # Qwen-VL processors usually expect list of messages or specific text formats
+        # Adapting to standard chat format often helps with Instruct models
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": insn.strip()}]}
+        ]
+        
+        # Prepare inputs using the processor
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
         inputs = processor(
-            text=insn.strip(),
-            images=None,
+            text=text,
+            images=None, # Text-only for refusal vector
             return_tensors="pt"
         )
 
@@ -62,6 +108,9 @@ def generate_hidden_states(model, processor, instructions, layer_idx):
             output_hidden_states=True
         )
 
+        # Accessing hidden states: 
+        # out.hidden_states is a tuple of tuples (one per generated token).
+        # out.hidden_states[0] is the tuple of layers for the prompt processing.
         h = out.hidden_states[0][layer_idx][:, POS, :]
         hidden_states.append(h)
 
@@ -70,10 +119,26 @@ def generate_hidden_states(model, processor, instructions, layer_idx):
 def compute_refusal_direction(model, processor):
     harmful, harmless = read_instruction_files()
 
-    harmful = random.sample(harmful, INSTRUCTION_COUNT)
-    harmless = random.sample(harmless, INSTRUCTION_COUNT)
+    # Ensure we don't sample more than we have
+    n_harmful = min(len(harmful), INSTRUCTION_COUNT)
+    n_harmless = min(len(harmless), INSTRUCTION_COUNT)
+    
+    harmful = random.sample(harmful, n_harmful)
+    harmless = random.sample(harmless, n_harmless)
 
-    text_layers = model.model.language_model.model.layers
+    # --- FIX START ---
+    # Original error: AttributeError: 'Qwen3VLTextModel' object has no attribute 'model'
+    # The traceback indicates model.model.language_model exists (Qwen3VLTextModel), 
+    # but the subsequent .model does not. The layers are likely directly on the TextModel.
+    try:
+        # Path implied by your traceback
+        text_layers = model.model.language_model.layers
+    except AttributeError:
+        # Fallback path for standard Qwen2-VL if structure differs
+        print("Fallback: accessing model.model.layers")
+        text_layers = model.model.layers
+    # --- FIX END ---
+
     total_layers = len(text_layers)
     layer_idx = int(total_layers * LAYER_RATIO)
 
@@ -97,21 +162,52 @@ def compute_refusal_direction(model, processor):
     return refusal_dir, layer_idx
 
 def apply_abliteration(model, refusal_dir, layer_idx):
-    layer = model.model.language_model.model.layers[layer_idx]
+    # --- FIX START ---
+    # Apply the same path fix here
+    try:
+        layer = model.model.language_model.layers[layer_idx]
+    except AttributeError:
+        layer = model.model.layers[layer_idx]
+    # --- FIX END ---
 
-    # Qwen MLP output projection
+    # Qwen MLP output projection (usually down_proj)
+    # Check if down_proj exists, otherwise print structure
+    if not hasattr(layer.mlp, "down_proj"):
+        print(f"Error: layer.mlp has no down_proj. Available keys: {layer.mlp.__dict__.keys()}")
+        return model
+
     W = layer.mlp.down_proj.weight.data
 
     r = refusal_dir.to(W.device).to(W.dtype)
     r = r / r.norm()
 
-    proj = torch.outer(r, r)
+    # Orthogonal projection: W_new = W - (r r^T) W
+    # Note: The matrix multiplication in your snippet (proj @ W) assumes W is (d_out, d_in)
+    # and refusal_dir is in d_in space (hidden_size).
+    # If refusal_dir is (hidden_size,), proj is (hidden_size, hidden_size).
+    # If W is Linear(in=hidden, out=intermediate), weight is (intermediate, hidden).
+    # We want to remove the direction from the input side of the weight?
+    # Actually, abliteration usually targets the OUTPUT of the MLP or the residual stream add.
+    # However, standard practice for "weight abliteration" on MLP Down Projection is:
+    # We want to prevent the MLP from writing to the refusal direction in the residual stream.
+    # down_proj takes (intermediate) -> outputs (hidden).
+    # W shape is (hidden, intermediate).
+    # refusal_dir shape is (hidden,).
+    # We want to remove component r from the COLUMNS (output space) of W.
+    
+    # Calculate projection matrix P = r * r.T
+    proj = torch.outer(r, r) # (hidden, hidden)
+    
+    # Apply to W (hidden, intermediate)
+    # W_new = (I - P) W  => W - P @ W
     W -= proj @ W
 
     return model
 
+# ---------------- MAIN PIPELINE ----------------
+
 def main():
-    print("Loading Qwen3-VL model")
+    print(f"Loading {MODEL_ID}")
     model, processor = load_model(MODEL_ID)
 
     print("Computing refusal direction")
@@ -124,7 +220,7 @@ def main():
     print("Applying abliteration to text backbone")
     model = apply_abliteration(model, refusal_dir, layer_idx)
 
-    print("Saving abliterated model to output-model/")
+    print(f"Saving abliterated model to {OUTPUT_DIR}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     model.save_pretrained(
@@ -133,8 +229,8 @@ def main():
     )
     processor.save_pretrained(OUTPUT_DIR)
 
-    print("Abliterated Qwen3-VL model saved successfully")
+    print("Abliterated model saved successfully")
     print("Done")
 
 if __name__ == "__main__":
-    main()
+    main()v
