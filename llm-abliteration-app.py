@@ -4,10 +4,7 @@ import torch
 import gradio as gr
 
 from tqdm import tqdm
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM
-)
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from huggingface_hub import HfApi, login
 
 
@@ -15,7 +12,7 @@ torch.set_grad_enabled(False)
 
 # ---------------- CONFIG ----------------
 
-DEFAULT_MODEL_ID = "tiiuae/Falcon3-1B-Instruct"
+DEFAULT_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
 INSTRUCTION_COUNT = 32
 DEFAULT_LAYER_RATIO = 0.6
 POS = -1
@@ -39,6 +36,9 @@ def load_model(model_id):
         trust_remote_code=True
     )
 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     return model, tokenizer
 
 
@@ -60,14 +60,17 @@ def generate_hidden_states(model, tokenizer, instructions, layer_idx):
     hidden_states = []
 
     for insn in tqdm(instructions, desc="Generating hidden states"):
-        toks = tokenizer.apply_chat_template(
+        enc = tokenizer.apply_chat_template(
             conversation=[{"role": "user", "content": insn}],
             add_generation_prompt=True,
             return_tensors="pt"
         )
 
+        attention_mask = torch.ones_like(enc)
+
         out = model.generate(
-            toks.to(model.device),
+            enc.to(model.device),
+            attention_mask=attention_mask.to(model.device),
             use_cache=False,
             max_new_tokens=1,
             return_dict_in_generate=True,
@@ -102,14 +105,18 @@ def compute_refusal_direction(model, tokenizer, layer_ratio):
     refusal_dir = harmful_mean - harmless_mean
     refusal_dir = refusal_dir / refusal_dir.norm()
 
-    return refusal_dir, layer_idx, total_layers
+    return refusal_dir.squeeze(), layer_idx, total_layers
 
 
 def apply_abliteration(model, refusal_dir, layer_idx):
-    W = model.model.layers[layer_idx].mlp.down_proj.weight.data
-    r = refusal_dir.squeeze()
+    layer = model.model.layers[layer_idx]
+
+    W = layer.mlp.down_proj.weight.data
+    r = refusal_dir.to(W.device)
+
     proj = torch.outer(r, r)
-    W -= W @ proj
+    W -= proj @ W
+
     return model
 
 
@@ -153,16 +160,14 @@ def run_abliteration(model_id, layer_ratio, hf_repo_id, hf_token):
 
     logs.append(f"Total layers: {total_layers}")
     logs.append(f"Layer ratio: {layer_ratio}")
-    logs.append(f"Computed layer_idx: {layer_idx}")
+    logs.append(f"Using layer_idx: {layer_idx}")
     logs.append(f"Saved refusal direction to {refusal_path}")
 
     logs.append("Applying abliteration")
     model = apply_abliteration(model, refusal_dir, layer_idx)
 
-    logs.append("Saving and pushing model to Hugging Face")
-    url = save_and_push_model(
-        model, tokenizer, hf_repo_id, hf_token
-    )
+    logs.append("Saving and pushing model")
+    url = save_and_push_model(model, tokenizer, hf_repo_id, hf_token)
 
     logs.append(f"Completed: {url}")
     return "\n".join(logs)
@@ -197,10 +202,7 @@ with gr.Blocks(title="LLM Refusal Abliteration Tool") as app:
 
     run_btn = gr.Button("Run Abliteration and Push Model")
 
-    output = gr.Textbox(
-        lines=14,
-        label="Logs"
-    )
+    output = gr.Textbox(lines=14, label="Logs")
 
     run_btn.click(
         fn=run_abliteration,
@@ -210,4 +212,4 @@ with gr.Blocks(title="LLM Refusal Abliteration Tool") as app:
 
 
 if __name__ == "__main__":
-    app.launch(share=True, debug=True)
+    app.launch(debug=True, share=True)
