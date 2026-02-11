@@ -6,7 +6,7 @@ torch
 bitsandbytes
 accelerate
 huggingface_hub
-gradio
+gradio==5.30.0
 hf_xet
 matplotlib
 qwen-vl-utils
